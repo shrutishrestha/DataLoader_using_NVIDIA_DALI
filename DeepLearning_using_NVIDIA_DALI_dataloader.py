@@ -1,13 +1,23 @@
-import os
 import csv
 import cv2
+import glob
+import math
+import nvtx
 import torch
+import shutil
 from datetime import datetime
+import warnings
 import numpy as np
 import pandas as pd
 import torch.nn as nn
+from random import shuffle
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+import nvidia.dali.fn as fn
+import nvidia.dali.ops as ops
+import nvidia.dali.types as types
+from nvidia.dali.pipeline import Pipeline
+from torchvision.io import read_image, ImageReadMode
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 import cProfile, pstats
 from sklearn.metrics import accuracy_score
@@ -16,44 +26,81 @@ import warnings
 warnings.filterwarnings("ignore")
 
 #for neural network
+import os
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-    
-    
+
+
+
+import torch
+import torch.nn as nn
+import nvidia.dali.fn as fn
+from nvidia.dali import pipeline_def
+from nvidia.dali.plugin.pytorch import DALIGenericIterator
+from nvidia.dali.plugin.pytorch import LastBatchPolicy
+
 def make(folderpathlist):
     for folderpath in folderpathlist:
         if not os.path.exists(folderpath):
             os.mkdir(folderpath)
             
-class CustomImageDataset(Dataset):
-    def __init__(self, annotations_file, img_dir, transform=False):
-        self.img_labels = pd.read_csv(annotations_file)
-        self.img_dir = img_dir
+@pipeline_def
+def custom_pipeline(files, image_dir, train):
+    jpegs, labels = fn.readers.file(file_root=image_dir)
+    images = fn.decoders.image(jpegs, device='mixed', output_type=types.RGB)
+    images = fn.resize(images, resize_x=512, resize_y=512)
+    if train:
+        mt = fn.transforms.rotation(angle = fn.random.uniform(range=(-45, 45)))
+        images = fn.warp_affine(images, matrix = mt, fill_value=0, inverse_map=False)
+        images = fn.brightness_contrast(images, brightness=fn.random.uniform(range=(0,1)), contrast= fn.random.uniform(range=(0,1)))
+        images = fn.saturation(images, saturation = fn.random.uniform(range=(0,1)))
+        images = fn.gaussian_blur(images, window_size=[5,5])
+    images = fn.transpose(images, perm=(2,0,1))
+    images = fn.normalize(images)
+    return images, labels.gpu()
 
-        self.transform = transforms.Compose([
-            transforms.ToPILImage(),
-            transforms.Resize((512,512)),
-            transforms.RandomRotation(45),
-            transforms.ColorJitter(saturation=1.2, brightness=(0, 1), contrast=(0, 1)),
-            transforms.GaussianBlur(kernel_size=(5,5)),
-            transforms.ToTensor()
-        ])
+class ExternalInputGpuIterator(DALIGenericIterator):
+    def __init__(self, pipelines, batch_size, files, last_batch_policy,  last_batch_padded, auto_reset=True):
+        super().__init__(pipelines=pipelines, last_batch_policy=last_batch_policy,  last_batch_padded = last_batch_padded, auto_reset=auto_reset, output_map=['images', 'labels'])
+        self.files = files
+        self.batch_size = batch_size
+        self.data_set_len = len(self.files)
+        self.n = self.data_set_len
+        
 
+    def __iter__(self):
+        self.i = 0
+        shuffle(self.files)
+        return self
 
     def __len__(self):
-        return len(self.img_labels)
+        return self.data_set_len
 
-    def __getitem__(self, idx):
+    def __next__(self):
 
-        img_path = os.path.join(self.img_dir, self.img_labels.iloc[idx, 0].strip())
-        
-        image = cv2.imread(img_path)
-        label = self.img_labels.iloc[idx, 1]
+        if self.i >= self.n:
+            self.__iter__()
+            raise StopIteration
 
-        if self.transform:
-            image = self.transform(image)
+        else:
+            out = super().__next__()
+            images = out[0]['images']
+            labels = out[0]['labels'] 
 
-        return image, label
+            q = (self.n - self.i) // self.batch_size
+            mod = (self.n - self.i) % self.batch_size
+            if q>0:
+                self.i = self.i + self.batch_size
+            else: 
+                self.i = self.i + mod
 
+            return (images, labels)
+   
+    next = __next__
+    
+    
 class BasicBlock(nn.Module):
     expansion = 1
     def __init__(self, in_planes, planes, stride = 1):
@@ -117,6 +164,7 @@ class Resnet(nn.Module):
         output = self.conv1(x)
         output = self.bn1(output)
         output = self.relu(output)
+        
         output = self.layer1(output)
         output = self.layer2(output)
         output = self.layer3(output)
@@ -134,25 +182,36 @@ def ResNet34():
     
     
 def main(args):
-        device = ("cuda" if torch.cuda.is_available() else "cpu" )    
-        if args["sbatch"]:
-            make([args["snapshot_directory"],args["snapshot_model_dir"], args["result_directory"], args["result_model_dir"]])
-            
+        
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+        # if args["sbatch"]:
+        #     make([args["snapshot_directory"],args["snapshot_model_dir"], args["result_directory"], args["result_model_dir"]]) 
 
-        # for dataset and dataloader
-        traindataset = CustomImageDataset(transform = True, annotations_file = args["train_file"], img_dir = args["train_dir"])     
-        valdataset = CustomImageDataset(annotations_file = args["val_file"], img_dir = args["val_dir"])     
         model = ResNet34().to(device)
         
-        model = torch.nn.DataParallel(model)
-
         criterion = torch.nn.BCELoss()
         optimizer = optim.Adam(model.parameters(), lr=0.01)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=4)
 
-        trainDataLoader = DataLoader(traindataset, batch_size=args["train_batch_size"], shuffle=False, num_workers=args["num_threads"], pin_memory=True)
-        valDataLoader = DataLoader(valdataset, batch_size=args["val_batch_size"], shuffle=False, num_workers=args["num_threads"], pin_memory=True)
+
+        train_file_list = os.listdir(os.path.join(args["train_dir"],"1"))+ os.listdir(os.path.join(args["train_dir"],"0"))
         
+        val_file_list = os.listdir(os.path.join(args["val_dir"],"1"))+ os.listdir(os.path.join(args["val_dir"],"0"))
+        
+        pipe_train_gpu = custom_pipeline(batch_size=args["train_batch_size"], device_id=args["device_id"],
+                                         num_threads=args["num_threads"], files= args["train_file"], 
+                                         set_affinity=args["set_affinity"], image_dir = args["train_dir"], train =True)
+
+        dali_train_iter = ExternalInputGpuIterator(pipe_train_gpu, batch_size=args["train_batch_size"], 
+                                                   last_batch_policy=LastBatchPolicy.PARTIAL,  last_batch_padded = False, files=train_file_list)
+        
+        pipe_val_gpu = custom_pipeline(batch_size=args["val_batch_size"], device_id=args["device_id"],
+                                         num_threads=args["num_threads"], files= args["val_file"], 
+                                         set_affinity=args["set_affinity"], image_dir = args["val_dir"], train=False)
+
+        dali_val_iter = ExternalInputGpuIterator(pipe_val_gpu, batch_size=args["val_batch_size"], 
+                                                   last_batch_policy=LastBatchPolicy.PARTIAL,  last_batch_padded = False, files=val_file_list)
         
         best_ckpt = {"epoch":-1, "current_val_metric":0, "model":model.state_dict()}
 
@@ -164,68 +223,64 @@ def main(args):
         train_acc_list = []
         val_loss_list = []
         val_acc_list = []
-
-        lenTrainDataLoader = len(trainDataLoader)
-        lenValDataLoader = len(valDataLoader)
+        
         
         for epoch in range(args["max_epochs"]):
-            print("epoch",epoch, datetime.now())
+            print("epoch", epoch, datetime.now())
             loss_sum = 0
             acc_sum = 0
 
-            for i, batch in enumerate(trainDataLoader):
 
-                image, label = batch
-                
-                image = image.to(device)
-                label = label.to(device)
-                label = label.to(torch.float)
+            for i, (images, labels) in enumerate(dali_train_iter):
+                images = images.to(torch.float32)
+                labels = labels.to(torch.float32)
 
                 optimizer.zero_grad()
-                logits = model(image).flatten()
+                logits = model(images)
 
                 pred_probab = nn.Sigmoid()(logits)
                 y_pred = (pred_probab>0.5)
                 
                 #forward pass
-                loss = criterion(pred_probab, label)
+                loss = criterion(pred_probab, labels)
                 #backward and optimize
                 loss.backward()
                 optimizer.step()
 
-                acc = accuracy_score(label.cpu(), y_pred.cpu())
+                acc = accuracy_score(labels.cpu(),y_pred.cpu())
                 loss_sum += loss.item()
                 acc_sum += acc.item()
-
-            train_loss = round(loss_sum/lenTrainDataLoader,6)
-            train_acc = round(acc_sum/lenTrainDataLoader,6)       
+            
+            train_loss = round(loss_sum/len(dali_train_iter),6)
+            train_acc = round(acc_sum/len(dali_train_iter),6)       
 
 
             model.eval()
             loss_sum = 0
             acc_sum = 0
+            
             with torch.no_grad():
-                for i, batch in enumerate(valDataLoader):
-                    image, label = batch
-                    image = image.to(device)
-                    label = label.to(device)
-                    label = label.to(torch.float)
-
-                    logits = model(image).flatten()
+                for i, (images, labels) in enumerate(dali_val_iter):              
+                    images = images.to(torch.float32)
+                    labels = labels.to(torch.float32)
+                    logits = model(images)
                     pred_probab = nn.Sigmoid()(logits)
                     y_pred = (pred_probab>0.5)
 
                     #forward pass
-                    loss = criterion(pred_probab, label)
+                    loss = criterion(pred_probab, labels)
 
                     #backward and optimize
-                    acc = accuracy_score(label.cpu(), y_pred.cpu())
+                    acc = accuracy_score(labels.cpu(),y_pred.cpu())
                     loss_sum += loss.item()
                     acc_sum += acc.item()
 
 
-            val_loss = round(loss_sum/lenValDataLoader,6)
-            val_acc = round(acc_sum/lenValDataLoader,6)  
+            val_loss = round(loss_sum/len(dali_val_iter),6)
+            val_acc = round(acc_sum/len(dali_val_iter),6)  
+            
+            dali_train_iter.reset()
+            dali_val_iter.reset()
             print(train_loss, val_loss, train_acc, val_acc)
 
             current_ckpt = {"epoch":epoch, "current_val_metric":val_acc, "model":model.state_dict()}
@@ -241,48 +296,46 @@ def main(args):
             val_acc_list.append(val_acc)
 
             scheduler.step(val_loss)
-        print("all done",datetime.now())
 
-        if args["sbatch"]:
+#         if args["sbatch"]:
 
-            header = ["epoch", "epoch start datetime", "train_loss", "train_acc", "val_loss", "val_acc"]
-            rows = zip(epoch_list, datetime_list, train_loss_list, train_acc_list, val_loss_list, val_acc_list)
+#             header = ["epoch", "epoch start datetime", "train_loss", "train_acc", "val_loss", "val_acc"]
+#             rows = zip(epoch_list, datetime_list, train_loss_list, train_acc_list, val_loss_list, val_acc_list)
 
-            with open(os.path.join(args["result_model_dir"], "results.csv"), 'w') as csvfile: 
-                csvwriter = csv.writer(csvfile) 
-                csvwriter.writerow(header) 
-                for row in rows:
-                    csvwriter.writerow(row) 
+#             with open(os.path.join(args["result_model_dir"], "results.csv"), 'w') as csvfile: 
+#                 csvwriter = csv.writer(csvfile) 
+#                 csvwriter.writerow(header) 
+#                 for row in rows:
+#                     csvwriter.writerow(row) 
 
-            torch.save(current_ckpt, args["current_checkpoint_fpath"])
-            torch.save(best_ckpt, args["best_checkpoint_fpath"])
+#             torch.save(current_ckpt, args["current_checkpoint_fpath"])
+#             torch.save(best_ckpt, args["best_checkpoint_fpath"])
 
-os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 args = {}
 fake = False
 cprof = True
 args["sbatch"] = False
-args["max_epochs"] = 4
-
-args["num_threads"] = 1
-
-args["seed"] = 42
-args["train_batch_size"] = 8
-args["val_batch_size"] = 8
+args["train_batch_size"]= 4
+args["val_batch_size"] = 4
 args["learning_rate"] = 0.01
-args["start_iters"] = 0
+args["device_id"] = 0
+args["num_threads"] = 1
+args["dataloader_output"] = 2
 args["set_affinity"] = True
+args["start_iters"] = 0
+args["max_epochs"] = 4
+args["seed"] = 42
 
 if fake:
-    args["train_file"]= "catdogs/fake/bc/train_all.csv"
-    args["val_file"]= "catdogs/fake/bc/val_all.csv"
-    args["train_dir"] = "catdogs/fake/bc/train_all"
-    args["val_dir"] = "catdogs/fake/bc/val_all"
+    args["train_file"]="catdogs/fake/dali/train_all_withoutlabels.csv"
+    args["val_file"]="catdogs/fake/dali/val_all_withoutlabels.csv"
+    args["train_dir"] = "catdogs/fake/dali/train"
+    args["val_dir"] = "catdogs/fake/dali/val"
 else:
-    args["train_file"]= "catdogs/real/bc/train_all.csv"
-    args["val_file"]= "catdogs/real/bc/val_all.csv"
-    args["train_dir"] = "catdogs/real/bc/train_all"
-    args["val_dir"] = "catdogs/real/bc/val_all"
+    args["train_file"]="catdogs/real/dali/train_all_withoutlabels.csv"
+    args["val_file"]="catdogs/real/dali/val_all_withoutlabels.csv"
+    args["train_dir"] = "catdogs/real/dali/train"
+    args["val_dir"] = "catdogs/real/dali/val"
 
 job_id = os.getenv('SLURM_JOB_ID')
 args["snapshot_directory"] = "/scratch/"+str(job_id)+"/snapshots/"
